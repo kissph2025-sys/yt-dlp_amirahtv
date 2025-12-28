@@ -84,8 +84,8 @@ class ViuIE(ViuBaseIE):
             m3u8_url = f'{url_path}/{tdirforwhole}/{hls_file}'
         else:
             # m3u8_url = re.sub(
-            #     r'(/hlsc_)[a-z]+(\d+\.m3u8)',
-            #     r'\1whe\2', video_data['href'])
+            #      r'(/hlsc_)[a-z]+(\d+\.m3u8)',
+            #      r'\1whe\2', video_data['href'])
             m3u8_url = video_data['href']
         formats, subtitles = self._extract_m3u8_formats_and_subtitles(m3u8_url, video_id, 'mp4')
 
@@ -198,15 +198,10 @@ class ViuOTTIE(InfoExtractor):
     }]
 
     _AREA_ID = {
-        'HK': 1,
-        'SG': 2,
-        'TH': 4,
-        'PH': 5,
+        'HK': 1, 'SG': 2, 'TH': 4, 'PH': 5,
     }
     _LANGUAGE_FLAG = {
-        'zh-hk': 1,
-        'zh-cn': 2,
-        'en-us': 3,
+        'zh-hk': 1, 'zh-cn': 2, 'en-us': 3,
     }
 
     _user_token = None
@@ -248,7 +243,6 @@ class ViuOTTIE(InfoExtractor):
                 }).encode())
             self._detect_error(data)
             self._user_token = data.get('identity')
-            # need to update with valid user's token else will throw an error again
             self._auth_codes[country_code] = data.get('token')
         return self._user_token
 
@@ -333,8 +327,6 @@ class ViuOTTIE(InfoExtractor):
             if token is not None:
                 query['identity'] = token
             else:
-                # The content is Preview or for VIP only.
-                # We can try to bypass the duration which is limited to 3mins only
                 duration_limit, query['duration'] = True, '180'
             try:
                 stream_data = download_playback()
@@ -346,28 +338,61 @@ class ViuOTTIE(InfoExtractor):
             raise ExtractorError('Cannot get stream info', expected=True)
 
         formats = []
-        for vid_format, stream_url in (stream_data.get('url') or {}).items():
+        subtitles = {}
+        stream_urls = stream_data.get('url') or {}
+
+        # ----------------------------------------------------------------------
+        # HYBRID APPROACH: Duplicate formats to ensure compatibility.
+        # 1. Add 'hls-...' formats (parsed from master playlist).
+        # 2. Add 's1080p' etc (parsed from keys) BUT point them to master URL.
+        # ----------------------------------------------------------------------
+
+        # Helper to get the correct Master URL
+        def get_master_url(original_url):
+            if 'viu_var_aws.m3u8' in original_url:
+                return original_url.replace('viu_var_aws.m3u8', 'viu_aws.m3u8')
+            return original_url
+
+        # 1. Extract proper HLS formats from the first available stream converted to Master
+        first_stream_url = next(iter(stream_urls.values()), None)
+        if first_stream_url:
+            master_url = get_master_url(first_stream_url)
+            try:
+                fmts, subs = self._extract_m3u8_formats_and_subtitles(
+                    master_url, video_id, 'mp4', m3u8_id='hls', fatal=False)
+                formats.extend(fmts)
+                self._merge_subtitles(subs, target=subtitles)
+            except Exception:
+                pass
+
+        # 2. Add Legacy Formats (s1080p, etc) but FORCE URL to Master Playlist
+        #    This allows -f s1080p to work, while delivering the correct viu_aws file.
+        for vid_format, stream_url in stream_urls.items():
             height = int(self._search_regex(r's(\d+)p', vid_format, 'height', default=None))
+            if not height: 
+                continue
+
+            # CRITICAL FIX: Rewrite the URL for these formats too
+            modified_url = get_master_url(stream_url)
 
             # bypass preview duration limit
             if duration_limit:
-                old_stream_url = urllib.parse.urlparse(stream_url)
-                query = dict(urllib.parse.parse_qsl(old_stream_url.query, keep_blank_values=True))
-                query.update({
+                old_stream_url = urllib.parse.urlparse(modified_url)
+                qs = dict(urllib.parse.parse_qsl(old_stream_url.query, keep_blank_values=True))
+                qs.update({
                     'duration': video_data.get('time_duration') or '9999999',
                     'duration_start': '0',
                 })
-                stream_url = old_stream_url._replace(query=urllib.parse.urlencode(query)).geturl()
+                modified_url = old_stream_url._replace(query=urllib.parse.urlencode(qs)).geturl()
 
             formats.append({
-                'format_id': vid_format,
-                'url': stream_url,
+                'format_id': vid_format, # Preserves 's1080p' ID
+                'url': modified_url,     # But points to 'viu_aws.m3u8'
                 'height': height,
                 'ext': 'mp4',
                 'filesize': try_get(stream_data, lambda x: x['size'][vid_format], int),
             })
 
-        subtitles = {}
         for sub in video_data.get('subtitle') or []:
             lang = sub.get('name') or 'und'
             if sub.get('url'):
